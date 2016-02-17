@@ -1,6 +1,3 @@
-
-Overview
-
 ## Description
 
 Today I Learned.
