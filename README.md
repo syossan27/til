@@ -11,6 +11,7 @@ Today I Learned.
 ## Contribution
 
 Please point out if there is such wrong content :-)
+
 間違っている内容などがあれば、ISSUEやPRでも何でもいいのでご指摘頂ければ幸いです。
 
 ## License
