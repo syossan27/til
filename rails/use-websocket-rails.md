@@ -10,6 +10,9 @@ config/initializers/redis.rbを作成する
 $redis = Redis.new(host: 'localhost', port: 6379, driver: :hiredis)
 ```
 
+※しないとこうなる
+![error1](https://github.com/syossan27/til/blob/master/image/rails_error_1.png)
+
 ## EventMachineの設定
 
 config/initializers/eventmachine.rbを作成する
