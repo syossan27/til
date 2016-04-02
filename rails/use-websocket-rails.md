@@ -1,6 +1,7 @@
 # websocket-railsの使い方
 
 基本的には公式に書いてある通りだがハマりどころを何点か。
+※今回はUnicornを使用
 
 ## Redisの接続先を設定する
 
@@ -48,3 +49,21 @@ config.standalone = true
 config.synclonize = false
 config.redis_options = {:host => 'localhost', :port => '6379', :driver => :hiredis}
 ```
+
+## JS Clientの接続設定
+
+```
+dispatcher = new WebSocketRails('localhost:3000/websocket')
+```
+
+## その他
+
+今回の場合、スタンドアローンサーバを立ち上げた状態、かつ接続先を3001ではなく3000にしなければwebsocketが使えるようにならなかった。
+
+3001に接続した場合、以下のエラーメッセージが表示された。
+
+```
+WebSocket connection to 'ws://localhost:3001/websocket' failed: Error in connection establishment: net::ERR_CONNECTION_REFUSED
+```
+
+また、スタンドアローンサーバを立ち上げなかった場合は3000ではエラーは出ないのだがイベントルータを通ってコントローラーまで処理が到達しなかった。
