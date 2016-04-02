@@ -15,11 +15,13 @@ $redis = Redis.new(host: 'localhost', port: 6379, driver: :hiredis)
 
 ## EventMachineの設定
 
-config/initializers/eventmachine.rbを作成する
+非スタンドアローンモードの場合、config/initializers/eventmachine.rbを作成する
 
 ```
 Thread.new { EventMachine.run } unless EventMachine.reactor_running? && EventMachine.reactor_thread.alive?
 ```
+
+※スタンドアローンモードの場合だと逆にスタンドアローンサーバが立ち上がらなくなるので注意
 
 ## 依存ライブラリであるfaye-websocketの特定バージョンを指定する
 
