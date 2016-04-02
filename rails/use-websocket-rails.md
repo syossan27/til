@@ -33,10 +33,18 @@ gem 'faye-websocket', '0.10.0'
 
 ## Redisを使用する場合のwebsocket設定
 
-websocket_rails.rbを以下のように設定
+非スタンドアローンモードの場合、websocket_rails.rbを以下のように設定
 
 ```
 config.standalone = false
 config.synclonize = true
+config.redis_options = {:host => 'localhost', :port => '6379', :driver => :hiredis}
+```
+
+スタンドアローンモードの場合、websocket_rails.rbを以下のように設定
+
+```
+config.standalone = true
+config.synclonize = false
 config.redis_options = {:host => 'localhost', :port => '6379', :driver => :hiredis}
 ```
