@@ -22,12 +22,74 @@ MutexやSemaphoreで排他制御を行なうのではなく、CASなどを使っ
 Goの場合、atomicパッケージにCAS実装がある。  
 [https://golang.org/pkg/sync/atomic/#CompareAndSwapInt32]
 
-<script src="https://gist.github.com/syossan27/0be761ce5ab68a30b92cd3bfd254dc6f.js"></script>
+```
+package main
+
+import (
+  "sync"
+  "fmt"
+)
+
+var (
+  balance int32 = 100
+  wg = sync.WaitGroup{}
+)
+
+func main() {
+  // expect: balance = 55
+  var i int32
+  for i = 0; i < 10; i++ {
+    wg.Add(1)
+    go withdraw(i)
+  }
+  wg.Wait()
+  fmt.Println(balance)
+}
+
+func withdraw(amount int32) {
+  balance = balance - amount
+  wg.Done()
+}
+```
 
 しかし、この方法だと当たり前だがgoroutineの処理タイミングによって全く違った値が算出される。  
 そこで、以下のようにCASを用いる。
 
-<script src="https://gist.github.com/syossan27/bd90e646f19738ba605bc8606b01f576.js"></script>
+```
+
+package main
+
+import (
+  "sync"
+  "fmt"
+  "sync/atomic"
+)
+
+var (
+  balance int32 = 100
+  wg = sync.WaitGroup{}
+)
+
+func main() {
+  // expect: balance = 55
+  var i int32
+  for i = 0; i < 10; i++ {
+    wg.Add(1)
+    go withdraw(i)
+  }
+  wg.Wait()
+  fmt.Println(balance)
+}
+
+func withdraw(amount int32) {
+  for {
+    if atomic.CompareAndSwapInt32(&balance, balance, balance - amount) {
+      break
+    }
+  }
+  wg.Done()
+}
+```
 
 すると、想定した55の値が常に算出される。
 
