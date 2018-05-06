@@ -249,7 +249,7 @@ Goのコアチームはsync.Mutexを使った構成より、CSPを使った構�
 
 どちらを使うかの意思決定ツリー
 
-![意思決定ツリー]("https://imgur.com/a/gafyH4o")
+![意思決定ツリー](https://imgur.com/a/gafyH4o)
 
 #### Are you trying to transfer ownership of data?
 
@@ -309,7 +309,7 @@ M:N scheduler ：N（ユーザー空間）内に複数のM（OSスレッドの�
 参考: https://morsmachine.dk/go-scheduler
 
 Goの並行性モデルはfork-joinモデル  
-![fork-joinモデル]("https://imgur.com/a/lFBex4g")
+![fork-joinモデル](https://imgur.com/a/lFBex4g)
 
 参考: https://en.wikipedia.org/wiki/Fork%E2%80%93join_model
 
