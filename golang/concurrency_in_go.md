@@ -587,3 +587,559 @@ fmt.Println("Done receiving!")
 このコードからカプセル化されたchanOwner内でcloseが複数回発生する可能性は排除されていることが分かる。  
 このようにchannelの所有権の法則に従うことで、安全性の高いプログラムになる。  
 channelの所有権が及ぶ範囲はなるべく狭くすること。
+
+## Chapter 4. Concurrency Patterns in Go
+
+### Confinement（閉じ込め）
+
+並行処理を書く際に安全に書くための２つの選択肢がある。
+
+- メモリを共有するための同期プリミティブ（ex. sync.Mutex）
+- 通信の同期化（ex.channel）
+
+他にもいくつか暗黙的な選択肢がある。
+
+- immutable data
+- confinementによってデータをプロテクト
+
+理想的にはimmutable dataを使うのが良い。  
+→ データ作成にはデータコピーしかないため、クリティカルセクションが狭まる
+
+confinementも認知負荷を軽くする効果がある。  
+confinementの種類には２種類あり、
+
+- ad hoc
+- lexical
+
+がある。
+
+#### ad hoc confinement
+
+「これはこうしようね」という規則によって縛るやり方。
+
+ex. 
+
+```
+data := make([]int, 4)
+
+loopData := func(handleData chan<- int) {
+    defer close(handleData)
+    for i := range data {
+        handleData <- data[i]
+    }
+}
+
+handleData := make(chan int)
+go loopData(handleData)
+
+for num := range handleData {
+    fmt.Println(num)
+}
+```
+
+この状態ではdataがloopData、handleDataの両方のループで利用できてしまう。  
+ただし、今回の場合は「loopDataのみで使うようにしようね」という縛りによって目的を達成しようとしている。
+
+#### lexical confinement
+
+レキシカルスコープを利用して、アクセスを絞るやり方。
+
+ex.
+
+```
+chanOwner := func() <-chan int {
+    results := make(chan int, 5)
+    go func() {
+        defer close(results)
+        for i := 0; i <= 5; i++ {
+            results <- i
+        }
+    }()
+    return results
+}
+
+consumer := func(results <-chan int) {
+    for result := range results {
+        fmt.Printf("Received: %d\n", result)
+    }
+    fmt.Println("Done receiving!")
+}
+
+results := chanOwner()
+consumer(results)
+```
+
+この例だとchanOwner内にあるdata部に対し、他から干渉することは不可能なため非常に安全な並行処理である。
+
+これに対して、安全ではない並行処理の例を見てみましょう。
+
+ex.
+
+```
+printData := func(wg *sync.WaitGroup, data []byte) {
+    defer wg.Done()
+
+    var buff bytes.Buffer
+    for _, b := range data {
+        fmt.Fprintf(&buff, "%c", b)
+    }
+    fmt.Println(buff.String())
+}
+
+var wg sync.WaitGroup
+wg.Add(2)
+data := []byte("golang")
+go printData(&wg, data[:3])
+go printData(&wg, data[3:])
+
+wg.Wait()
+```
+
+安全な並行処理を書くことによって、データがいつどこで変更されるのかという関心事から解放され、クリティカルセクションもないためパフォーマンスも向上する。
+
+しかし、時には同期プリミティブを使わなければならない場合もあります。
+
+### for-select
+
+既知なので割愛
+
+### Preventing Goroutine Leaks 
+
+goroutineはGCで解放されないパティーンがあるため、goroutineを綺麗に保たなければならない。
+
+goroutineが終了する３つの条件
+
+- 動作の完了
+- recover不能なエラーにより、作業が続行出来ない場合
+- 作業の終了を伝達され場合
+
+上２つの条件では解放される。  
+しかし、キャンセルの場合はgoroutineがcleanupされることを検討しなくてはならない。
+
+ex. goroutine leak
+
+```
+doWork := func(strings <-chan string) <-chan interface{} {
+    completed := make(chan interface{})
+    go func() {
+        defer fmt.Println("doWork exited.")
+        defer close(completed)
+        for s := range strings {
+            // Do something interesting
+            fmt.Println(s)
+        }
+    }()
+    return completed
+}
+
+doWork(nil)
+// Perhaps more work is done here
+fmt.Println("Done.")
+```
+
+この例では、doWorkにnil channelが渡されることにより、文字列の出力が始まらずメモリリークを起こします。  
+幸いにもこの例はライフサイクルが短いため、特に問題にはならないが、通常は長期間動作させるためその場合問題になる。
+
+さらに親goroutineが子goroutineの終了に関して、何の権限も持たないのが問題である。  
+そのため、親goroutineが子goroutineにキャンセルを通知できるようにする。
+
+ex.
+
+```
+doWork := func(
+  done <-chan interface{},
+  strings <-chan string,
+) <-chan interface{} {
+    terminated := make(chan interface{})
+    go func() {
+        defer fmt.Println("doWork exited.")
+        defer close(terminated)
+        for {
+            select {
+            case s := <-strings:
+                // Do something interesting
+                fmt.Println(s)
+            case <-done:
+                return
+            }
+        }
+    }()
+    return terminated
+}
+
+done := make(chan interface{})
+terminated := doWork(done, nil)
+
+go func() {
+    // Cancel the operation after 1 second.
+    time.Sleep(1 * time.Second)
+    fmt.Println("Canceling doWork goroutine...")
+    close(done)
+}()
+
+<-terminated
+fmt.Println("Done.")
+```
+
+こうすることで、子goroutineがどのような状況になろうとも親goroutineから処理をキャンセルすることができる。
+
+また、リークする状況としては以下のように子goroutine側が永遠に終わらない状況も考えられる。
+
+ex.
+
+```
+newRandStream := func() <-chan int {
+    randStream := make(chan int)
+    go func() {
+        defer fmt.Println("newRandStream closure exited.") 1
+        defer close(randStream)
+        for {
+            randStream <- rand.Int()
+        }
+    }()
+
+    return randStream
+}
+
+randStream := newRandStream()
+fmt.Println("3 random ints:")
+for i := 1; i <= 3; i++ {
+    fmt.Printf("%d: %d\n", i, <-randStream)
+}
+```
+
+この状況も先ほどの解決法と同じく、キャンセル処理を実装して解決できる。
+
+ex.
+
+```
+newRandStream := func(done <-chan interface{}) <-chan int {
+    randStream := make(chan int)
+    go func() {
+        defer fmt.Println("newRandStream closure exited.")
+        defer close(randStream)
+        for {
+            select {
+            case randStream <- rand.Int():
+            case <-done:
+                return
+            }
+        }
+    }()
+
+    return randStream
+}
+
+done := make(chan interface{})
+randStream := newRandStream(done)
+fmt.Println("3 random ints:")
+for i := 1; i <= 3; i++ {
+    fmt.Printf("%d: %d\n", i, <-randStream)
+}
+close(done)
+
+// Simulate ongoing work
+time.Sleep(1 * time.Second)
+```
+
+このように親goroutineから子goroutineに対してキャンセルを通知することで、メモリリークは防げるが逆に親goroutineではキャンセル通知をするという責任が発生するので気を付けなれければいけない。
+
+### The or-channel 
+
+複数チャンネル内でどれかのチャンネルが終了したら、すべてのチャンネルを終了するという機構。
+
+ex.
+
+```
+var or func(channels ...<-chan interface{}) <-chan interface{}
+or = func(channels ...<-chan interface{}) <-chan interface{} {
+    switch len(channels) {
+    case 0:
+        return nil
+    case 1:
+        return channels[0]
+    }
+
+    orDone := make(chan interface{})
+    go func() {
+        defer close(orDone)
+
+        switch len(channels) {
+        case 2:
+            select {
+            case <-channels[0]:
+            case <-channels[1]:
+            }
+        default:
+            select {
+            case <-channels[0]:
+            case <-channels[1]:
+            case <-channels[2]:
+            case <-or(append(channels[3:], orDone)...):
+            }
+        }
+    }()
+    return orDone
+}
+```
+
+以下のように、いずれかのチャンネルがタイムアップした場合にすべての処理を打ち切るということが出来る。
+
+ex.
+
+```
+sig := func(after time.Duration) <-chan interface{}{ 1
+    c := make(chan interface{})
+    go func() {
+        defer close(c)
+        time.Sleep(after)
+    }()
+    return c
+}
+
+start := time.Now() 2
+<-or(
+    sig(2*time.Hour),
+    sig(5*time.Minute),
+    sig(1*time.Second),
+    sig(1*time.Hour),
+    sig(1*time.Minute),
+)
+fmt.Printf("done after %v", time.Since(start)) 3
+```
+
+### Error Handling
+
+並行処理でのエラーハンドリングで考えなければいけないことは「誰がエラーをハンドリングするか？」である。
+
+ex.
+
+```
+checkStatus := func(
+  done <-chan interface{},
+  urls ...string,
+) <-chan *http.Response {
+    responses := make(chan *http.Response)
+    go func() {
+        defer close(responses)
+        for _, url := range urls {
+            resp, err := http.Get(url)
+            if err != nil {
+                fmt.Println(err) 1
+                continue
+            }
+            select {
+            case <-done:
+                return
+            case responses <- resp:
+            }
+        }
+    }()
+    return responses
+}
+
+done := make(chan interface{})
+defer close(done)
+
+urls := []string{"https://www.google.com", "https://badhost"}
+for response := range checkStatus(done, urls...) {
+    fmt.Printf("Response: %v\n", response.Status)
+}
+```
+
+正しい方法としては、この並行プロセスに関する完全な情報をどこかで持っておき、そこでエラーを保持するというやり方。
+
+ex1.
+
+```
+type Result struct {
+    Error error
+    Response *http.Response
+}
+checkStatus := func(done <-chan interface{}, urls ...string) <-chan Result {
+    results := make(chan Result)
+    go func() {
+        defer close(results)
+
+        for _, url := range urls {
+            var result Result
+            resp, err := http.Get(url)
+            result = Result{Error: err, Response: resp}
+            select {
+            case <-done:
+                return
+            case results <- result:
+            }
+        }
+    }()
+    return results
+}
+```
+
+ex2.
+
+```
+done := make(chan interface{})
+defer close(done)
+
+urls := []string{"https://www.google.com", "https://badhost"}
+for result := range checkStatus(done, urls...) {
+    if result.Error != nil { 5
+        fmt.Printf("error: %v", result.Error)
+        continue
+    }
+    fmt.Printf("Response: %v\n", result.Response.Status)
+}
+```
+
+ここで重要なのは子goroutineの情報を親goroutineがコントロールできる、という点です。  
+エラーハンドリングについては子goroutineから上手く分離できた状態になります。
+
+こうすることで、以下のようなハンドリングができます。
+
+ex.
+
+```
+
+done := make(chan interface{})
+defer close(done)
+
+errCount := 0
+urls := []string{"a", "https://www.google.com", "b", "c", "d"}
+for result := range checkStatus(done, urls...) {
+    if result.Error != nil {
+        fmt.Printf("error: %v\n", result.Error)
+        errCount++
+        if errCount >= 3 {
+            fmt.Println("Too many errors, breaking!")
+            break
+        }
+        continue
+    }
+    fmt.Printf("Response: %v\n", result.Response.Status)
+}
+```
+
+これで３つ以上のエラーが帰ってきた場合には、処理を打ち切るということができます。
+
+### Pipelines
+
+`あんま意味分からんのでもっかい読む`
+
+抽象化のためにパイプラインという仕組みを用いる。  
+ステージを用いるメリットとして、各ステージでの問題の分離が出来るなど多数のメリットがある。
+
+ex.
+
+```
+multiply := func(values []int, multiplier int) []int {
+    multipliedValues := make([]int, len(values))
+    for i, v := range values {
+        multipliedValues[i] = v * multiplier
+    }
+    return multipliedValues
+}
+```
+
+これは整数のスライスをループさせながら乗算する単純なステージです。
+
+ex.
+
+```
+add := func(values []int, additive int) []int {
+    addedValues := make([]int, len(values))
+    for i, v := range values {
+        addedValues[i] = v + additive
+    }
+    return addedValues
+}
+```
+
+これは整数のスライスをループさせながら和算する単純なステージです。  
+さて、これらを組み合わせてみましょう。
+
+ex.
+
+```
+ints := []int{1, 2, 3, 4}
+for _, v := range add(multiply(ints, 2), 1) {
+    fmt.Println(v)
+}
+```
+
+このように、高次関数やモナドのような処理を書くことが出来る。
+
+それではこれらをchannelを使って書き直してみる。
+
+ex.
+
+```
+generator := func(done <-chan interface{}, integers ...int) <-chan int {
+    intStream := make(chan int)
+    go func() {
+        defer close(intStream)
+        for _, i := range integers {
+            select {
+            case <-done:
+                return
+            case intStream <- i:
+            }
+        }
+    }()
+    return intStream
+}
+
+multiply := func(
+  done <-chan interface{},
+  intStream <-chan int,
+  multiplier int,
+) <-chan int {
+    multipliedStream := make(chan int)
+    go func() {
+        defer close(multipliedStream)
+        for i := range intStream {
+            select {
+            case <-done:
+                return
+            case multipliedStream <- i*multiplier:
+            }
+        }
+    }()
+    return multipliedStream
+}
+
+add := func(
+  done <-chan interface{},
+  intStream <-chan int,
+  additive int,
+) <-chan int {
+    addedStream := make(chan int)
+    go func() {
+        defer close(addedStream)
+        for i := range intStream {
+            select {
+            case <-done:
+                return
+            case addedStream <- i+additive:
+            }
+        }
+    }()
+    return addedStream
+}
+
+done := make(chan interface{})
+defer close(done)
+
+intStream := generator(done, 1, 2, 3, 4)
+pipeline := multiply(done, add(done, multiply(done, intStream, 2), 1), 2)
+
+for v := range pipeline {
+    fmt.Println(v)
+}
+```
+
+generatorはintスライスを順次分解してchannelに送る、これはデータストリームに変換する処理とも言いかえることが出来る。
+
+![挙動表](https://imgur.com/XTfFKFN.jpg)
+
+
