@@ -1555,3 +1555,777 @@ If your algorithm behaves differently based on what is or isn’t included in it
 
 また、関数の引数として値を渡すか、context valueとして値を渡し、目に見えない依存を作るかで色々と意見が分かれそうなので事前にチームで話し合うこと。
 
+## Chapter 5. Concurrency at Scale
+
+### Error Propagation
+
+> Many developers make the mistake of thinking of error propagation as secondary, or “other,” to the flow of their system. 
+> Careful consideration is given to how data flows through the system, but errors are something that are tolerated and ferried up the stack without much thought, and ultimately dumped in front of the user. 
+> Go attempted to correct this bad practice by forcing users to handle errors at every frame in the call stack, but it’s still common to see errors treated as second-class citizens to the system’s control flow. 
+> With just a little forethought, and minimal overhead, you can make your error handling an asset to your system, and a delight to your users.
+
+エラーの内容として必要なもの：
+
+- 何が起こったのか？
+- いつ、どこで発生したのか？（完全なスタックトレースが必要、但しメッセージとして出す必要性は無い。また分散システムにおいては物理的にどのマシンでエラーになったか？の情報も必要）
+- ユーザーフレンドリーなメッセージ
+- ユーザーがより多くのエラー情報を取得できる（エラーの完全表示に対応する）
+
+エラー種別としては２種類
+
+- バグ
+- known edge case, 既知のエッジケース（ディスク書き込みの失敗、ネットワークコネクションの切断、etc...）
+
+以下のようなCLI Component→Intermediary(媒介) Component→Low Level Componentのようなシステムについて考えてみましょう。
+
+![component](https://imgur.com/ycZRtaR.jpg)
+
+各コンポーネントの境界で以下のようなエラーに関するラッピング構造が必要となります。
+
+```
+func PostReport(id string) error {
+    result, err := lowlevel.DoWork()
+    if err != nil {
+        if _, ok := err.(lowlevel.Error); ok {
+            err = WrapErr(err, "cannot post report with id %q", id)
+        }
+        return err
+    }
+ // ...
+}
+```
+
+何故かと言うと、ここで各モジュールが指定しているエラータイプに合致しているかという判断をしなくてはいけないためです。  
+エラータイプにはエラーとして内部的に持たなければいけない情報が入るはずです。  
+またknown edge caseとバグについてもこのラッピング構造で区別することが出来ます。  
+
+ユーザー側のエラーメッセージとして、エラーIDを含み表示することで興味のあるユーザーにエラー内容を調べる余地を残す。
+
+それらを踏まえて、以下のコード。
+
+```
+type MyError struct {
+    Inner      error
+    Message    string
+    StackTrace string
+    Misc       map[string]interface{}
+}
+
+func wrapError(err error, messagef string, msgArgs ...interface{}) MyError {
+    return MyError{
+        Inner:      err,
+        Message:    fmt.Sprintf(messagef, msgArgs...),
+        StackTrace: string(debug.Stack()),
+        Misc:       make(map[string]interface{}),
+    }
+}
+
+func (err MyError) Error() string {
+    return err.Message
+}
+```
+
+次はLowLevel Module
+
+```
+type LowLevelErr struct {
+    error
+}
+
+func isGloballyExec(path string) (bool, error) {
+    info, err := os.Stat(path)
+    if err != nil {
+        return false, LowLevelErr{(wrapError(err, err.Error()))}
+    }
+    return info.Mode().Perm()&0100 == 0100, nil
+}
+```
+
+さらにIntermediate Module
+
+```
+type IntermediateErr struct {
+    error
+}
+
+func runJob(id string) error {
+    const jobBinPath = "/bad/job/binary"
+    isExecutable, err := isGloballyExec(jobBinPath)
+    if err != nil {
+        return err
+    } else if isExecutable == false {
+        return wrapError(nil, "job binary is not executable")
+    }
+
+    return exec.Command(jobBinPath, "--id="+id).Run()
+}
+```
+
+最後にCLI Module
+
+```
+func handleError(key int, err error, message string) {
+    log.SetPrefix(fmt.Sprintf("[logID: %v]: ", key))
+    log.Printf("%#v", err) 3
+    fmt.Printf("[%v] %v", key, message)
+}
+
+func main() {
+    log.SetOutput(os.Stdout)
+    log.SetFlags(log.Ltime|log.LUTC)
+
+    err := runJob("1")
+    if err != nil {
+        msg := "There was an unexpected issue; please report this as a bug."
+        if _, ok := err.(IntermediateErr); ok {
+            msg = err.Error()
+        }
+        handleError(1, err, msg)
+    }
+}
+```
+
+これを実行すると以下のようなログになる。
+
+```
+  [logID: 1]: 21:46:07 main.LowLevelErr{error:main.MyError{Inner:
+  (*os.PathError)(0xc4200123f0),
+  Message:"stat /bad/job/binary: no such file or directory",
+  StackTrace:"goroutine 1 [running]:
+  runtime/debug.Stack(0xc420012420, 0x2f, 0xc420045d80)
+      /home/kate/.guix-profile/src/runtime/debug/stack.go:24 +0x79
+  main.wrapError(0x530200, 0xc4200123f0, 0xc420012420, 0x2f, 0x0, 0x0,
+  0x0, 0x0, 0x0, 0x0, ...)
+      /tmp/babel-79540aE/go-src-7954NTK.go:22 +0x62
+  main.isGloballyExec(0x4d1313, 0xf, 0xc420045eb8, 0x487649, 0xc420056050)
+      /tmp/babel-79540aE/go-src-7954NTK.go:37 +0xaa
+  main.runJob(0x4cfada, 0x1, 0x4d4c35, 0x22)
+      /tmp/babel-79540aE/go-src-7954NTK.go:47 +0x48
+  main.main()
+      /tmp/babel-79540aE/go-src-7954NTK.go:67 +0x63
+  ", Misc:map[string]interface {}{}}}
+```
+
+標準出力に表示されるメッセージとしては以下のような形に。
+
+```
+[1] There was an unexpected issue; please report this as a bug.
+```
+
+Intermediate Moduleのエラー内容が抽象的過ぎるため、少し修正。
+
+```
+type IntermediateErr struct {
+    error
+}
+
+func runJob(id string) error {
+    const jobBinPath = "/bad/job/binary"
+    isExecutable, err := isGloballyExec(jobBinPath)
+    if err != nil {
+        return IntermediateErr{wrapError(
+            err,
+            "cannot run job %q: requisite binaries not available",
+            id,
+        )} 1
+    } else if isExecutable == false {
+        return wrapError(
+            nil,
+            "cannot run job %q: requisite binaries are not executable",
+            id,
+        )
+    }
+
+    return exec.Command(jobBinPath, "--id="+id).Run()
+}
+```
+
+これでログはこんな感じに。
+
+```
+  [logID: 1]: 22:11:04 main.IntermediateErr{error:main.MyError
+  {Inner:main.LowLevelErr{error:main.MyError{Inner:(*os.PathError)
+  (0xc4200123f0), Message:"stat /bad/job/binary: no such file or directory",
+  StackTrace:"goroutine 1 [running]:
+  runtime/debug.Stack(0xc420012420, 0x2f, 0x0)
+      /home/kate/.guix-profile/src/runtime/debug/stack.go:24 +0x79
+  main.wrapError(0x530200, 0xc4200123f0, 0xc420012420, 0x2f, 0x0, 0x0,
+  0x0, 0x0, 0x0, 0x0, ...)
+      /tmp/babel-79540aE/go-src-7954DTN.go:22 +0xbb
+  main.isGloballyExec(0x4d1313, 0xf, 0x4daecc, 0x30, 0x4c5800)
+      /tmp/babel-79540aE/go-src-7954DTN.go:39 +0xc5
+  main.runJob(0x4cfada, 0x1, 0x4d4c19, 0x22)
+      /tmp/babel-79540aE/go-src-7954DTN.go:51 +0x4b
+  main.main()
+      /tmp/babel-79540aE/go-src-7954DTN.go:71 +0x63
+  ", Misc:map[string]interface {}{}}}, Message:"cannot run job \"1\":
+  requisite binaries not available", StackTrace:"goroutine 1 [running]:
+  runtime/debug.Stack(0x4d63f0, 0x33, 0xc420045e40)
+      /home/kate/.guix-profile/src/runtime/debug/stack.go:24 +0x79
+  main.wrapError(0x530380, 0xc42000a370, 0x4d63f0, 0x33,
+  0xc420045e40, 0x1, 0x1, 0x0, 0x0, 0x0, ...)
+      /tmp/babel-79540aE/go-src-7954DTN.go:22 +0xbb
+  main.runJob(0x4cfada, 0x1, 0x4d4c19, 0x22)
+      /tmp/babel-79540aE/go-src-7954DTN.go:53 +0x356
+  main.main()
+      /tmp/babel-79540aE/go-src-7954DTN.go:71 +0x63
+  ", Misc:map[string]interface {}{}}}
+
+```
+
+ユーザーメッセージはこう。
+
+```
+[1] cannot run job "1": requisite binaries not available
+```
+
+### Timeouts and Cancellation
+
+タイムアウトが必要な理由：
+
+- リトライされる可能性が低い場合
+- リクエストを処理するリソース（ディスク容量、メモリ、etc...）が無い場合
+- デッドロックの阻止のため（ライブロックになる可能性もあるが、大規模システムの場合タイミングがかち合う可能性は低い
+
+キャンセルが必要な理由：
+
+- 時間の長い処理の場合にはユーザーに進捗を見せないといけない、その時にユーザーの手でキャンセル処理をされる場合があるため
+- 親goroutineが子goroutineに対してキャンセルする場合があるため
+- 複数プロセスの中で早く処理が終わったものを採用し、他をキャンセルする場合があるため
+
+それではいつでもキャンセルできる機構を考えてみる。
+
+```
+var value interface{}
+select {
+case <-done:
+    return
+case value = <-valueStream:
+}
+
+result := reallyLongCalculation(value)
+
+select {
+case <-done:
+    return
+case resultStream<-result:
+}
+```
+
+↑のコードには大きな問題がある。   
+それはこのgoroutineが実行される時、 `reallyLongCalculation` によって大きくブロッキングされキャンセル処理をその間受け付けないからだ。   
+それでは `reallyLongCalculation` をプリエンプティブにしよう。
+
+```
+reallyLongCalculation := func(
+    done <-chan interface{},
+    value interface{},
+) interface{} {
+    intermediateResult := longCalculation(value)
+    select {
+    case <-done:
+        return nil
+    default:
+    }
+
+    return longCaluclation(intermediateResult)
+}
+```
+
+さて、ここで更に問題なのが、 `longCalculation` でも同様の問題が起こるということ。   
+そう、本当にプリエンプティブにしなければいけないのは `longCalculation` だったのです。  
+というわけで、 `longCalculation` をプリエンプティブにした上で、 `reallyLOngCalculation` は以下のようにしましょう。
+
+```
+reallyLongCalculation := func(
+    done <-chan interface{},
+    value interface{},
+) interface{} {
+    intermediateResult := longCalculation(done, value)
+    return longCaluclation(done, intermediateResult)
+}
+```
+
+ここで大事なのは、goroutineを正しく小さく分け、atomicな箇所をプリエンプティブにしていくことです。  
+
+さらに、キャンセルされた後の処理としてロールバックしなければいけません。  
+以下の例は悪手な例です。
+
+```
+result := add(1, 2, 3)
+writeTallyToState(result)
+result = add(result, 4, 5, 6)
+writeTallyToState(result)
+result = add(result, 7, 8, 9)
+writeTallyToState(result)
+```
+
+この場合、３回目の `writeTallyToState` でキャンセルされ、ロールバックが必要な事態になった場合、どうすればいいでしょうか？   
+以下の場合ならそれを考える必要性は薄くなります。
+
+```
+result := add(1, 2, 3, 4, 5, 6, 7, 8, 9)
+writeTallyToState(result)
+```
+
+なぜなら、 `writeTallyToState` 内で正しくロールバックするよう組み込めばいいだけなのですから。
+
+また別の問題として考えなければいけないのは、メッセージ重複です。  
+以下のようなパイプライン処理の場合、ステージBが重複してメッセージを受け取る可能性があります。
+
+![duplicateMessage](https://imgur.com/ot4ncmY.jpg)
+
+既に、GeneratorがメッセージをステージAに投げた後にキャンセルされた場合、後続処理が止められず重複メッセージになるという問題です。
+
+対策として最も簡単なものが、子goroutineが走り出して結果を受け取るまで親goroutineはキャンセルを受け付けないようにする方法です。  
+これはheartbeatの章で詳細に話します。
+
+他のアプローチとしては、
+
+- 重複メッセージを許容し、キャンセルを受け付けた前か後のどちらかの情報を渡す。
+- メッセージを送信する前に親goroutineに許可を得るようにする（heartbeatに似ている）
+
+後者については以下のようなイメージ
+
+![likeHeartbeat](https://imgur.com/vEK3zOu.jpg)
+
+しかし、この方法は実際の所heartbeatよりも複雑になるため、heartbeatを使う方が良い。
+
+### Heartbeats
+
+この章では２種類のheartbeatsを説明する。
+
+- 時間間隔ごとのheartbeats
+- 作業単位ごとのheartbeats
+
+それではheartbeatsなコードを見てみる。
+
+```
+doWork := func(
+    done <-chan interface{},
+    pulseInterval time.Duration,
+) (<-chan interface{}, <-chan time.Time) {
+    heartbeat := make(chan interface{})
+    results := make(chan time.Time)
+    go func() {
+        defer close(heartbeat)
+        defer close(results)
+
+        pulse := time.Tick(pulseInterval)
+        workGen := time.Tick(2*pulseInterval)
+
+        sendPulse := func() {
+            select {
+            case heartbeat <-struct{}{}:
+            default:
+            }
+        }
+        sendResult := func(r time.Time) {
+            for {
+                select {
+                case <-done:
+                    return
+                case <-pulse:
+                    sendPulse()
+                case results <- r:
+                    return
+                }
+            }
+        }
+
+        for {
+            select {
+            case <-done:
+                return
+            case <-pulse:
+                sendPulse()
+            case r := <-workGen:
+                sendResult(r)
+            }
+        }
+    }()
+    return heartbeat, results
+}
+```
+
+結果を送信している間、入力を待つ間にもheartbeatsのパルス送信をする必要があります。
+
+それではこのheartbeatsを実装した `doWork` を使った例を見てみましょう。
+
+```
+done := make(chan interface{})
+time.AfterFunc(10*time.Second, func() { close(done) })
+
+const timeout = 2*time.Second
+heartbeat, results := doWork(done, timeout/2)
+for {
+    select {
+    case _, ok := <-heartbeat:
+        if ok == false {
+            return
+        }
+        fmt.Println("pulse")
+    case r, ok := <-results:
+        if ok == false {
+            return
+        }
+        fmt.Printf("results %v\n", r.Second())
+    case <-time.After(timeout):
+        return
+    }
+}
+```
+
+1s毎にheartbeats pulseを送り、10sにはtimeoutとなる処理です。  
+結果はこうなります。
+
+```
+pulse
+pulse
+results 52
+pulse
+pulse
+results 54
+pulse
+pulse
+results 56
+pulse
+pulse
+results 58
+pulse
+```
+
+次に、擬似的にpanicを引き起こし、途中で処理が止まる状況を試してみましょう。
+
+```
+doWork := func(
+    done <-chan interface{},
+    pulseInterval time.Duration,
+) (<-chan interface{}, <-chan time.Time) {
+    heartbeat := make(chan interface{})
+    results := make(chan time.Time)
+    go func() {
+        pulse := time.Tick(pulseInterval)
+        workGen := time.Tick(2*pulseInterval)
+
+        sendPulse := func() {
+            select {
+            case heartbeat <-struct{}{}:
+            default:
+            }
+        }
+        sendResult := func(r time.Time) {
+            for {
+                select {
+                case <-pulse:
+                    sendPulse()
+                case results <- r:
+                    return
+                }
+            }
+        }
+
+        for i := 0; i < 2; i++ { // 擬似的にpanicを引き起こす
+            select {
+            case <-done:
+                return
+            case <-pulse:
+                sendPulse()
+            case r := <-workGen:
+                sendResult(r)
+            }
+        }
+    }()
+    return heartbeat, results
+}
+
+done := make(chan interface{})
+time.AfterFunc(10*time.Second, func() { close(done) })
+
+const timeout = 2 * time.Second
+heartbeat, results := doWork(done, timeout/2)
+for {
+    select {
+    case _, ok := <-heartbeat:
+        if ok == false {
+            return
+        }
+        fmt.Println("pulse")
+    case r, ok := <-results:
+        if ok == false {
+            return
+        }
+        fmt.Printf("results %v\n", r)
+    case <-time.After(timeout):
+        fmt.Println("worker goroutine is not healthy!")
+        return
+    }
+}
+```
+
+結果は以下。
+
+```
+pulse
+pulse
+worker goroutine is not healthy!
+```
+
+panicでheartbeats pulseが途絶えてから2s後には異常を感知して終了しいることが分かります。   
+これにより、デッドロックを回避できていることが分かります。  
+このことについては"Healing Unhealthy Goroutines"の項で深掘りしていきます。
+
+次は、作業単位ごとのheartbeatsです。
+
+```
+doWork := func(done <-chan interface{}) (<-chan interface{}, <-chan int) {
+    heartbeatStream := make(chan interface{}, 1)
+    workStream := make(chan int)
+    go func () {
+        defer close(heartbeatStream)
+        defer close(workStream)
+
+        for i := 0; i < 10; i++ {
+            select {
+            case heartbeatStream <- struct{}{}:
+            default:
+            }
+
+            select {
+            case <-done:
+                return
+            case workStream <- rand.Intn(10):
+            }
+        }
+    }()
+
+    return heartbeatStream, workStream
+}
+
+done := make(chan interface{})
+defer close(done)
+
+heartbeat, results := doWork(done)
+for {
+    select {
+    case _, ok := <-heartbeat:
+        if ok {
+            fmt.Println("pulse")
+        } else {
+            return
+        }
+    case r, ok := <-results:
+        if ok {
+            fmt.Printf("results %v\n", r)
+        } else {
+            return
+        }
+    }
+}
+```
+
+生成した乱数を送信する毎にheartbeat pulseを送っている。  
+結果は以下。
+
+```
+pulse
+results 1
+pulse
+results 7
+pulse
+results 7
+pulse
+results 9
+pulse
+results 1
+pulse
+results 8
+pulse
+results 5
+pulse
+results 0
+pulse
+results 6
+pulse
+results 0
+```
+
+この作業単位でのheartbeatsが役立つのはテストを書く時です。  
+以下はselect statementに入る前に遅延したら、という状況を再現したコードです。
+
+```
+func DoWork(
+    done <-chan interface{},
+    nums ...int,
+) (<-chan interface{}, <-chan int) {
+    heartbeat := make(chan interface{}, 1)
+    intStream := make(chan int)
+    go func() {
+        defer close(heartbeat)
+        defer close(intStream)
+
+        time.Sleep(2*time.Second)
+
+        for _, n := range nums {
+            select {
+            case heartbeat <- struct{}{}:
+            default:
+            }
+
+            select {
+            case <-done:
+                return
+            case intStream <- n:
+            }
+        }
+    }()
+
+    return heartbeat, intStream
+}
+```
+
+それではこの関数をテストしてみましょう。   
+まずは悪い例です。
+
+```
+func TestDoWork_GeneratesAllNumbers(t *testing.T) {
+    done := make(chan interface{})
+    defer close(done)
+
+    intSlice := []int{0, 1, 2, 3, 5}
+    _, results := DoWork(done, intSlice...)
+
+    for i, expected := range intSlice {
+        select {
+        case r := <-results:
+            if r != expected {
+                t.Errorf(
+                  "index %v: expected %v, but received %v,",
+                  i,
+                  expected,
+                  r,
+                )
+            }
+        case <-time.After(1 * time.Second):
+            t.Fatal("test timed out")
+        }
+    }
+}
+```
+
+結果は以下です。
+
+```
+go test ./bad_concurrent_test.go
+--- FAIL: TestDoWork_GeneratesAllNumbers (1.00s)
+    bad_concurrent_test.go:46: test timed out
+FAIL
+FAIL    command-line-arguments  1.002s
+```
+
+このようにテストの結果が成功したり、失敗したりブレます。  
+nondeterministic（非決定論的）とも言えます。  
+Timeoutを増やすことも出来ますが、失敗すると時間がかかりテスト全体の時間が遅くなります。
+
+それではこれを対策していきましょう。
+
+```
+func TestDoWork_GeneratesAllNumbers(t *testing.T) {
+    done := make(chan interface{})
+    defer close(done)
+
+    intSlice := []int{0, 1, 2, 3, 5}
+    heartbeat, results := DoWork(done, intSlice...)
+
+    <-heartbeat
+
+    i := 0
+    for r := range results {
+        if expected := intSlice[i]; r != expected {
+            t.Errorf("index %v: expected %v, but received %v,", i, expected, r)
+        }
+        i++
+    }
+}
+```
+
+結果は以下。
+
+```
+ok command-line-arguments 2.002s
+```
+
+また、時間間隔ごとのheartbeatsのテストはこのように書きます。
+
+```
+func DoWork(
+    done <-chan interface{},
+    pulseInterval time.Duration,
+    nums ...int,
+) (<-chan interface{}, <-chan int) {
+    heartbeat := make(chan interface{}, 1)
+    intStream := make(chan int)
+    go func() {
+        defer close(heartbeat)
+        defer close(intStream)
+
+        time.Sleep(2*time.Second)
+
+        pulse := time.Tick(pulseInterval)
+        numLoop:
+        for _, n := range nums {
+            for {
+                select {
+                case <-done:
+                    return
+                case <-pulse:
+                    select {
+                    case heartbeat <- struct{}{}:
+                    default:
+                    }
+                case intStream <- n:
+                    continue numLoop
+                }
+            }
+        }
+    }()
+
+    return heartbeat, intStream
+}
+
+func TestDoWork_GeneratesAllNumbers(t *testing.T) {
+    done := make(chan interface{})
+    defer close(done)
+
+    intSlice := []int{0, 1, 2, 3, 5}
+    const timeout = 2*time.Second
+    heartbeat, results := DoWork(done, timeout/2, intSlice...)
+
+    <-heartbeat
+
+    i := 0
+    for {
+        select {
+        case r, ok := <-results:
+            if ok == false {
+                return
+            } else if expected := intSlice[i]; r != expected {
+                t.Errorf(
+                    "index %v: expected %v, but received %v,",
+                    i,
+                    expected,
+                    r,
+                )
+            }
+            i++
+        case <-heartbeat:
+        case <-time.After(timeout):
+            t.Fatal("test timed out")
+        }
+    }
+}
+```
+
+長時間動作するgoroutine、テストが必要なgoroutineについてはheartbeatsパターンを採用する価値がある。
+
+
