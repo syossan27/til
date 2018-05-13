@@ -1024,6 +1024,8 @@ for result := range checkStatus(done, urls...) {
 
 ### Pipelines
 
+参考：https://blog.golang.org/pipelines
+
 `あんま意味分からんのでもっかい読む`
 
 抽象化のためにパイプラインという仕組みを用いる。  
@@ -1142,4 +1144,414 @@ generatorはintスライスを順次分解してchannelに送る、これはデ�
 
 ![挙動表](https://imgur.com/XTfFKFN.jpg)
 
+しかし、パイプラインのあるステージが非常に遅くなった場合はパイプライン全体のボトルネックになる。  
+これを緩和するためにFan-Out, Fan-Inがある。
+
+#### Fan-Out, Fan-In
+
+何もわからない・・・  
+あとでもう一度調べる
+
+#### or-done-channel
+
+```
+for val := range myChan {
+      // Do something with val
+}
+```
+
+に対して、for-select Loopのルールを当てはめると
+
+```
+loop:
+for {
+    select {
+    case <-done:
+        break loop
+    case maybeVal, ok := <-myChan:
+        if ok == false {
+            return // or maybe break from for
+        }
+        // Do something with val
+    }
+}
+```
+
+になるが、この場合の問題点として `Do something with val` の処理如何によってはネストが更に深くなり混乱を招く可能性が生まれる。  
+そのため、goroutineを使って以下のように書き直すのが望ましい。
+
+```
+orDone := func(done, c <-chan interface{}) <-chan interface{} {
+    valStream := make(chan interface{})
+    go func() {
+        defer close(valStream)
+        for {
+            select {
+            case <-done:
+                return
+            case v, ok := <-c:
+                if ok == false {
+                    return
+                }
+                select {
+                case valStream <- v:
+                case <-done:
+                }
+            }
+        }
+    }()
+    return valStream
+}
+```
+
+こうすることで、キャンセル機構をカプセル化した関数に任せることが出来る。
+
+```
+for val := range orDone(done, myChan) {
+    // Do something with val
+}
+```
+
+ネストが一気に浅くなった。
+
+#### The tee-channel
+
+```
+tee := func(
+    done <-chan interface{},
+    in <-chan interface{},
+) (_, _ <-chan interface{}) { <-chan interface{}) {
+    out1 := make(chan interface{})
+    out2 := make(chan interface{})
+    go func() {
+        defer close(out1)
+        defer close(out2)
+        for val := range orDone(done, in) {
+            var out1, out2 = out1, out2 1
+            for i := 0; i < 2; i++ { 2
+                select {
+                case <-done:
+                case out1<-val:
+                    out1 = nil 3
+                case out2<-val:
+                    out2 = nil 3
+                }
+            }
+        }
+    }()
+    return out1, out2
+}
+```
+
+channelを複数に分けて、内容を出し分ける。  
+goroutineごとに複数値を使う時に重宝する？
+
+使う時はこう。
+
+```
+done := make(chan interface{})
+defer close(done)
+
+out1, out2 := tee(done, take(done, repeat(done, 1, 2), 4))
+
+for val1 := range out1 {
+    fmt.Printf("out1: %v, out2: %v\n", val1, <-out2)
+}
+```
+
+#### The bridge-channel 
+
+channelのchannelを使って順次処理するパターン。
+
+```
+bridge := func(
+    done <-chan interface{},
+    chanStream <-chan <-chan interface{},
+) <-chan interface{} {
+    valStream := make(chan interface{})
+    go func() {
+        defer close(valStream)
+        for {
+            var stream <-chan interface{}
+            select {
+            case maybeStream, ok := <-chanStream:
+                if ok == false {
+                    return
+                }
+                stream = maybeStream
+            case <-done:
+                return
+            }
+            for val := range orDone(done, stream) {
+                select {
+                case valStream <- val:
+                case <-done:
+                }
+            }
+        }
+    }()
+    return valStream
+}
+```
+
+```
+genVals := func() <-chan <-chan interface{} {
+    chanStream := make(chan (<-chan interface{}))
+    go func() {
+        defer close(chanStream)
+        for i := 0; i < 10; i++ {
+            stream := make(chan interface{}, 1)
+            stream <- i
+            close(stream)
+            chanStream <- stream
+        }
+    }()
+    return chanStream
+}
+
+for v := range bridge(nil, genVals()) {
+    fmt.Printf("%v ", v)
+}
+```
+
+channelのchannelの他の使い方ってなんかあるのか調べたい。
+
+#### Queuing
+
+早期にQueingを導入するとdeadlockやlivelockなどの問題を隠蔽してしまうので注意。  
+Queingのメリットはパフォーマンス上のメリットではない。
+
+以下さっぱり分からん
+
+#### context package
+
+contextパッケージの利点
+
+- コールグラフの分岐をキャンセルするためのAPIを用意している
+- コールグラフを介してリクエストスコープのデータを転送するためのデータバッグを提供する
+
+コールグラフ：コンピュータプログラムのサブルーチン同士の呼び出し関係を表現した有向グラフ   
+リクエストスコープ：リクエスト内でのみ使用できる情報、もしくはその「範囲」
+
+また、Preventing Goroutine Leaksの項でも述べたようにキャンセルに焦点を合わすと３つの側面が浮かび上がる
+
+- 親goroutineがキャンセルをしたい
+- goroutineはぶら下がる子goroutineをキャンセルしたい
+- goroutineのブロッキング操作はキャンセル可能なようにプリエンプティブにする必要がある
+
+contextパッケージは、これら3つすべてを管理するのに役立ちます。
+
+> この精神では、コンテキストのインスタンスはプログラムのコールグラフを流れるようになっています。
+> オブジェクト指向のパラダイムでは、頻繁に使用されるデータへの参照をメンバ変数として格納するのが一般的ですが、context.Contextのインスタンスではこれを行わないことが重要です。
+> context.Contextのインスタンスは外部から見えるかもしれませんが、内部的にはスタックフレームごとに変更されることがあります。
+> このため、常にContextのインスタンスを関数に渡すことが重要です。
+
+contextを使う前のコード
+
+```
+func main() {
+    var wg sync.WaitGroup
+    done := make(chan interface{})
+    defer close(done)
+
+    wg.Add(1)
+    go func() {
+        defer wg.Done()
+        if err := printGreeting(done); err != nil {
+            fmt.Printf("%v", err)
+            return
+        }
+    }()
+
+    wg.Add(1)
+    go func() {
+        defer wg.Done()
+        if err := printFarewell(done); err != nil {
+            fmt.Printf("%v", err)
+            return
+        }
+    }()
+
+    wg.Wait()
+}
+
+func printGreeting(done <-chan interface{}) error {
+    greeting, err := genGreeting(done)
+    if err != nil {
+        return err
+    }
+    fmt.Printf("%s world!\n", greeting)
+    return nil
+}
+
+func printFarewell(done <-chan interface{}) error {
+    farewell, err := genFarewell(done)
+    if err != nil {
+        return err
+    }
+    fmt.Printf("%s world!\n", farewell)
+    return nil
+}
+
+func genGreeting(done <-chan interface{}) (string, error) {
+    switch locale, err := locale(done); {
+    case err != nil:
+        return "", err
+    case locale == "EN/US":
+        return "hello", nil
+    }
+    return "", fmt.Errorf("unsupported locale")
+}
+
+func genFarewell(done <-chan interface{}) (string, error) {
+    switch locale, err := locale(done); {
+    case err != nil:
+        return "", err
+    case locale == "EN/US":
+        return "goodbye", nil
+    }
+    return "", fmt.Errorf("unsupported locale")
+}
+
+func locale(done <-chan interface{}) (string, error) {
+    select {
+    case <-done:
+        return "", fmt.Errorf("canceled")
+    case <-time.After(1*time.Minute):
+    }
+    return "EN/US", nil
+}
+```
+
+使用後
+
+```
+func main() {
+    var wg sync.WaitGroup
+    ctx, cancel := context.WithCancel(context.Background())
+    defer cancel()
+
+    wg.Add(1)
+    go func() {
+        defer wg.Done()
+
+        if err := printGreeting(ctx); err != nil {
+            fmt.Printf("cannot print greeting: %v\n", err)
+            cancel()
+        }
+    }()
+
+    wg.Add(1)
+    go func() {
+        defer wg.Done()
+        if err := printFarewell(ctx); err != nil {
+            fmt.Printf("cannot print farewell: %v\n", err)
+        }
+    }()
+
+    wg.Wait()
+}
+
+func printGreeting(ctx context.Context) error {
+    greeting, err := genGreeting(ctx)
+    if err != nil {
+        return err
+    }
+    fmt.Printf("%s world!\n", greeting)
+    return nil
+}
+
+func printFarewell(ctx context.Context) error {
+    farewell, err := genFarewell(ctx)
+    if err != nil {
+        return err
+    }
+    fmt.Printf("%s world!\n", farewell)
+    return nil
+}
+
+func genGreeting(ctx context.Context) (string, error) {
+    ctx, cancel := context.WithTimeout(ctx, 1*time.Second)
+    defer cancel()
+
+    switch locale, err := locale(ctx); {
+    case err != nil:
+        return "", err
+    case locale == "EN/US":
+        return "hello", nil
+    }
+    return "", fmt.Errorf("unsupported locale")
+}
+
+func genFarewell(ctx context.Context) (string, error) {
+    switch locale, err := locale(ctx); {
+    case err != nil:
+        return "", err
+    case locale == "EN/US":
+        return "goodbye", nil
+    }
+    return "", fmt.Errorf("unsupported locale")
+}
+
+func locale(ctx context.Context) (string, error) {
+    select {
+    case <-ctx.Done():
+        return "", ctx.Err()
+    case <-time.After(1 * time.Minute):
+    }
+    return "EN/US", nil
+}
+```
+
+1秒以上の処理時間でタイムアウト、またgreeting（挨拶）が失敗したらfarewell（お別れ）をキャンセルするよう実装している。   
+またdeadlineの設定があるかどうかを調べるには以下のように書き直す。
+
+```
+func locale(ctx context.Context) (string, error) {
+    if deadline, ok := ctx.Deadline(); ok {
+        if deadline.Sub(time.Now().Add(1*time.Minute)) <= 0 {
+            return "", context.DeadlineExceeded
+        }
+    }
+
+    select {
+    case <-ctx.Done():
+        return "", ctx.Err()
+    case <-time.After(1 * time.Minute):
+    }
+    return "EN/US", nil
+}
+```
+
+contextパッケージを使うなら、循環参照の可能性を省くためにdata typeに関するパッケージを据えた方がいいと書いてあるっぽい。   
+また、 `WithValue` については型安全ではないので、注意が必要。リクエストスコープ内のデータを扱うためと理解する。
+
+> Use context values only for request-scoped data that transits processes and
+> API boundaries, not for passing optional parameters to functions.
+
+参考：https://deeeet.com/writing/2017/02/23/go-context-value/
+
+作者は「処理がContextのValueによって振る舞いが変わる場合、オプションパラメータの領域になっている可能性が高い」と述べている。  
+context valueはimmutableであるべき。
+
+以下、作者が考えるcontext valueに関する経験則。
+
+```
+1) The data should transit process or API boundaries.
+If you generate the data in your process’ memory, it’s probably not a good candidate to be request-scoped data unless you also pass it across an API boundary.
+
+2) The data should be immutable.
+If it’s not, then by definition what you’re storing did not come from the request.
+
+3) The data should trend toward simple types.
+If request-scoped data is meant to transit process and API boundaries, it’s much easier for the other side to pull this data out if it doesn’t also have to import a complex graph of packages.
+
+4) The data should be data, not types with methods.
+Operations are logic and belong on the things consuming this data.
+
+5) The data should help decorate operations, not drive them.
+If your algorithm behaves differently based on what is or isn’t included in its Context, you have likely crossed over into the territory of optional parameters.
+```
+
+また、関数の引数として値を渡すか、context valueとして値を渡し、目に見えない依存を作るかで色々と意見が分かれそうなので事前にチームで話し合うこと。
 
