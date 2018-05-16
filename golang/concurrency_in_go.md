@@ -2328,4 +2328,468 @@ func TestDoWork_GeneratesAllNumbers(t *testing.T) {
 
 長時間動作するgoroutine、テストが必要なgoroutineについてはheartbeatsパターンを採用する価値がある。
 
+### Replicated Requests
+
+HTTPリクエストやデータ処理などでいち早くユーザーにレスポンスを返すために、同一処理をする複数goroutineを動かし、一番早くレスポンスを返したgoroutineの結果を採用する。   
+欠点としてはリソースを喰うこと。
+
+```
+doWork := func(
+    done <-chan interface{},
+    id int,
+    wg *sync.WaitGroup,
+    result chan<- int,
+) {
+    started := time.Now()
+    defer wg.Done()
+
+    // Simulate random load
+    simulatedLoadTime := time.Duration(1+rand.Intn(5))*time.Second
+    select {
+    case <-done:
+    case <-time.After(simulatedLoadTime):
+    }
+
+    select {
+    case <-done:
+    case result <- id:
+    }
+
+    took := time.Since(started)
+    // Display how long handlers would have taken
+    if took < simulatedLoadTime {
+        took = simulatedLoadTime
+    }
+    fmt.Printf("%v took %v\n", id, took)
+}
+
+done := make(chan interface{})
+result := make(chan int)
+
+var wg sync.WaitGroup
+wg.Add(10)
+
+for i:=0; i < 10; i++ { 1
+    go doWork(done, i, &wg, result)
+}
+
+firstReturned := <-result 2
+close(done) 3
+wg.Wait()
+
+fmt.Printf("Received an answer from #%v\n", firstReturned)
+```
+
+これはgoroutineがランダムな時間スリープし、結果を返すプログラムです。
+
+```
+8 took 1.000211046s
+4 took 3s
+9 took 2s
+1 took 1.000568933s
+7 took 2s
+3 took 1.000590992s
+5 took 5s
+0 took 3s
+6 took 4s
+2 took 2s
+Received an answer from #8
+```
+
+今回の結果で一番早く返ってきたのは8番のプロセスですね。  
+仮に1つだけのプロセスしか回さなかった場合、最悪5sかかる見込みでした。
+
+この方法は全体の処理時間が均一になるような場合にはリソースを消耗するというデメリットしかありません。  
+異なるプロセス、マシン、データストアへのパス、または異なるデータストアへのアクセスという、異なる実行時条件を持つ処理には効果的です。  
+またその他の効用として、フォールトトレランスとスケーラビリティを持ちます。
+
+### Rate Limiting
+
+悪意のある攻撃に立ち向かうため、レート制限。  
+分散システムにおいても、あるユーザーによる大量アクセスによる障害が他のユーザーのリクエストに影響を与える可能性がある。  
+またクラウドサービスを使用している場合、悪意ある大量アクセスにより料金がかさんで死、という自体をアプリケーション側で防げる。
+
+さて、レート制限にはトークンバケットと呼ばれる方法で実装する。  
+トークンバケットは簡単に言うと、リソースへのアクセスにトークンを必要とし、そのトークンの最大保持数を制限するというもの。  
+例えば、トークンバケットの保持数を5とすると、一度にリソースにアクセスできる上限が5ということ。  
+そして、トークンが補充される時間をリフレッシュレートとすれば完成である。
+
+トークンバケットはバースト性（大量の同時リクエスト）を許容しているため、特にそこには制限をかけない。  
+全ユーザーがトークンバケットの限界までバーストすることは可能性として低いと考えるためである。
+
+```
+func main() {
+    defer log.Printf("Done.")
+    log.SetOutput(os.Stdout)
+    log.SetFlags(log.Ltime | log.LUTC)
+
+    apiConnection := Open()
+    var wg sync.WaitGroup
+    wg.Add(20)
+
+    for i := 0; i < 10; i++ {
+        go func() {
+            defer wg.Done()
+            err := apiConnection.ReadFile(context.Background())
+            if err != nil {
+                log.Printf("cannot ReadFile: %v", err)
+            }
+            log.Printf("ReadFile")
+        }()
+    }
+
+    for i := 0; i < 10; i++ {
+        go func() {
+            defer wg.Done()
+            err := apiConnection.ResolveAddress(context.Background())
+            if err != nil {
+                log.Printf("cannot ResolveAddress: %v", err)
+            }
+            log.Printf("ResolveAddress")
+        }()
+    }
+
+    wg.Wait()
+}
+
+func Open() *APIConnection {
+    return &APIConnection{}
+}
+
+type APIConnection struct {}
+
+func (a *APIConnection) ReadFile(ctx context.Context) error {
+    // Pretend we do work here
+    return nil
+}
+
+func (a *APIConnection) ResolveAddress(ctx context.Context) error {
+    // Pretend we do work here
+    return nil
+}
+```
+
+上記のプログラムを例にレート制限を実装していく。  
+パッケージには `golang.org/x/time/rate` を使います。
+
+```
+func Open() *APIConnection {
+    return &APIConnection{
+        rateLimiter: rate.NewLimiter(rate.Limit(1), 1),
+    }
+}
+
+type APIConnection struct {
+    rateLimiter *rate.Limiter
+}
+
+func (a *APIConnection) ReadFile(ctx context.Context) error {
+    if err := a.rateLimiter.Wait(ctx); err != nil {
+        return err
+    }
+    // Pretend we do work here
+    return nil
+}
+
+func (a *APIConnection) ResolveAddress(ctx context.Context) error {
+    if err := a.rateLimiter.Wait(ctx); err != nil {
+        return err
+    }
+    // Pretend we do work here
+    return nil
+}
+```
+
+これで結果が１つずつ順に出てくる。  
+今回は1秒に1リクエストを捌くようにしてある。  
+またレート制限をmultipleにした実装が以下。
+
+```
+type RateLimiter interface {
+    Wait(context.Context) error
+    Limit() rate.Limit
+}
+
+func MultiLimiter(limiters ...RateLimiter) *multiLimiter {
+    byLimit := func(i, j int) bool {
+        return limiters[i].Limit() < limiters[j].Limit()
+    }
+    sort.Slice(limiters, byLimit)
+    return &multiLimiter{limiters: limiters}
+}
+
+type multiLimiter struct {
+    limiters []RateLimiter
+}
+
+func (l *multiLimiter) Wait(ctx context.Context) error {
+    for _, l := range l.limiters {
+        if err := l.Wait(ctx); err != nil {
+            return err
+        }
+    }
+    return nil
+}
+
+func (l *multiLimiter) Limit() rate.Limit {
+    return l.limiters[0].Limit()
+}
+```
+
+こんな風に使用する。
+
+```
+func Open() *APIConnection {
+    secondLimit := rate.NewLimiter(Per(2, time.Second), 1)
+    minuteLimit := rate.NewLimiter(Per(10, time.Minute), 10)
+    return &APIConnection{
+        rateLimiter: MultiLimiter(secondLimit, minuteLimit),
+    }
+}
+
+type APIConnection struct {
+    rateLimiter RateLimiter
+}
+
+func (a *APIConnection) ReadFile(ctx context.Context) error {
+    if err := a.rateLimiter.Wait(ctx); err != nil {
+        return err
+    }
+    // Pretend we do work here
+    return nil
+}
+
+func (a *APIConnection) ResolveAddress(ctx context.Context) error {
+    if err := a.rateLimiter.Wait(ctx); err != nil {
+        return err
+    }
+    // Pretend we do work here
+    return nil
+}
+```
+
+このように、細かいレート制限をかけることもできます。  
+最後にもう一つ、ディスクとネットワークについてもレート制限をかけてみましょう。
+
+```
+func Open() *APIConnection {
+    return &APIConnection{
+        apiLimit: MultiLimiter(
+            rate.NewLimiter(Per(2, time.Second), 2),
+            rate.NewLimiter(Per(10, time.Minute), 10),
+        ),
+        diskLimit: MultiLimiter(
+            rate.NewLimiter(rate.Limit(1), 1),
+        ),
+        networkLimit: MultiLimiter(
+            rate.NewLimiter(Per(3, time.Second), 3),
+        ),
+    }
+}
+
+type APIConnection struct {
+    networkLimit,
+    diskLimit,
+    apiLimit RateLimiter
+}
+
+func (a *APIConnection) ReadFile(ctx context.Context) error {
+    err := MultiLimiter(a.apiLimit, a.diskLimit).Wait(ctx)
+    if err != nil {
+        return err
+    }
+    // Pretend we do work here
+    return nil
+}
+
+func (a *APIConnection) ResolveAddress(ctx context.Context) error {
+    err := MultiLimiter(a.apiLimit, a.networkLimit).Wait(ctx)
+    if err != nil {
+        return err
+    }
+    // Pretend we do work here
+    return nil
+}
+```
+
+### Healing Unhealthy Goroutines
+
+長時間実行されるgoroutineを"回復"させるメカニズム。  
+heartbeatsパターンを使って実装していきます。
+
+以下のコードではgoroutineのhealthyを監視するロジックをスチュワードと呼びます。
+
+```
+type startGoroutineFn func(
+    done <-chan interface{},
+    pulseInterval time.Duration,
+) (heartbeat <-chan interface{})
+
+newSteward := func(
+    timeout time.Duration,
+    startGoroutine startGoroutineFn,
+) startGoroutineFn {
+    return func(
+        done <-chan interface{},
+        pulseInterval time.Duration,
+    ) (<-chan interface{}) {
+        heartbeat := make(chan interface{})
+        go func() {
+            defer close(heartbeat)
+
+            var wardDone chan interface{}
+            var wardHeartbeat <-chan interface{}
+            startWard := func() {
+                wardDone = make(chan interface{})
+                wardHeartbeat = startGoroutine(or(wardDone, done), timeout/2)
+            }
+            startWard()
+            pulse := time.Tick(pulseInterval)
+
+        monitorLoop:
+            for {
+                timeoutSignal := time.After(timeout)
+
+                for {
+                    select {
+                    case <-pulse:
+                        select {
+                        case heartbeat <- struct{}{}:
+                        default:
+                        }
+                    case <-wardHeartbeat:
+                        continue monitorLoop
+                    case <-timeoutSignal:
+                        log.Println("steward: ward unhealthy; restarting")
+                        close(wardDone)
+                        startWard()
+                        continue monitorLoop
+                    case <-done:
+                        return
+                    }
+                }
+            }
+        }()
+
+        return heartbeat
+    }
+}
+```
+
+さて、上記のコードを用いてみましょう。
+
+```
+log.SetOutput(os.Stdout)
+log.SetFlags(log.Ltime | log.LUTC)
+
+doWork := func(done <-chan interface{}, _ time.Duration) <-chan interface{} {
+    log.Println("ward: Hello, I'm irresponsible!")
+    go func() {
+        <-done 1
+        log.Println("ward: I am halting.")
+    }()
+    return nil
+}
+doWorkWithSteward := newSteward(4*time.Second, doWork) 2
+
+done := make(chan interface{})
+time.AfterFunc(9*time.Second, func() { 3
+    log.Println("main: halting steward and ward.")
+    close(done)
+})
+
+for range doWorkWithSteward(done, 4*time.Second) {} 4
+log.Println("Done")
+```
+
+このコードでは4s毎にスチュワードが監視し、 `doWork` は常にキャンセルされるようになっています。  
+そして、9s後には終了するようにしてあります。  
+結果は以下。
+
+```
+18:28:07 ward: Hello, I'm irresponsible!
+18:28:11 steward: ward unhealthy; restarting
+18:28:11 ward: Hello, I'm irresponsible!
+18:28:11 ward: I am halting.
+18:28:15 steward: ward unhealthy; restarting
+18:28:15 ward: Hello, I'm irresponsible!
+18:28:15 ward: I am halting.
+18:28:16 main: halting steward and ward.
+18:28:16 ward: I am halting.
+18:28:16 Done
+```
+
+さて、毎回 `doWork` を作成するのも大変なので、クロージャーを用いて解決してみます。
+
+```
+doWorkFn := func(
+    done <-chan interface{},
+    intList ...int,
+) (startGoroutineFn, <-chan interface{}) { 1
+    intChanStream := make(chan (<-chan interface{})) 2
+    intStream := bridge(done, intChanStream)
+    doWork := func(
+        done <-chan interface{},
+        pulseInterval time.Duration,
+    ) <-chan interface{} { 3
+        intStream := make(chan interface{}) 4
+        heartbeat := make(chan interface{})
+        go func() {
+            defer close(intStream)
+            select {
+            case intChanStream <- intStream: 5
+            case <-done:
+                return
+            }
+
+            pulse := time.Tick(pulseInterval)
+
+            for {
+                valueLoop:
+                for _, intVal := range intList {
+                    if intVal < 0 {
+                        log.Printf("negative value: %v\n", intVal) 6
+                        return
+                    }
+
+                    for {
+                        select {
+                        case <-pulse:
+                            select {
+                            case heartbeat <- struct{}{}:
+                            default:
+                            }
+                        case intStream <- intVal:
+                            continue valueLoop
+                        case <-done:
+                            return
+                        }
+                    }
+                }
+            }
+        }()
+        return heartbeat
+    }
+    return doWork, intStream
+}
+```
+
+使用する際にはブリッジチャンネルを用います。
+
+```
+log.SetFlags(log.Ltime | log.LUTC)
+log.SetOutput(os.Stdout)
+
+done := make(chan interface{})
+defer close(done)
+
+doWork, intStream := doWorkFn(done, 1, 2, -1, 3, 4, 5) 1
+doWorkWithSteward := newSteward(1*time.Millisecond, doWork) 2
+doWorkWithSteward(done, 1*time.Hour) 3
+
+for intVal := range take(done, intStream, 6) { 4
+    fmt.Printf("Received: %v\n", intVal)
+}
+```
+
 
