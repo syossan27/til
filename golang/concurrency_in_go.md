@@ -209,6 +209,9 @@ wg.Wait()
 
 資源飢餓はGoプロセス以外がリソースを確保することでも起こるので注意。
 
+ここの記事が分かりやすかった。   
+参考：https://medium.com/@11Takanori/concurrency-in-go-chapter1-7-2145e9bc539b
+
 ### 並行性の安全性
 
 `func CalculatePi(begin, end int64) []uint`
